@@ -19,6 +19,19 @@
 
 #include "ogs-proto.h"
 
+#include <stdio.h>
+#include <string.h>
+
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdh.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+
+
+
 #define PLMN_ID_DIGIT1(x) (((x) / 100) % 10)
 #define PLMN_ID_DIGIT2(x) (((x) / 10) % 10)
 #define PLMN_ID_DIGIT3(x) ((x) % 10)
@@ -194,6 +207,413 @@ ogs_amf_id_t *ogs_amf_id_build(ogs_amf_id_t *amf_id,
     return amf_id;
 }
 
+/* Convert an EC key's public key to a binary array. */
+int ec_key_public_key_to_bin(const EC_KEY  *ec_key,
+                             uint8_t      **pubk,     // out (must free)
+                             size_t        *pubk_len) // out
+{
+        const EC_GROUP *ec_group   = EC_KEY_get0_group(ec_key);
+        const EC_POINT *pub        = EC_KEY_get0_public_key(ec_key);
+        BIGNUM         *pub_bn     = BN_new();
+        BN_CTX         *pub_bn_ctx = BN_CTX_new();
+
+        BN_CTX_start(pub_bn_ctx);
+
+        EC_POINT_point2bn(ec_group, pub, POINT_CONVERSION_COMPRESSED,
+                          pub_bn, pub_bn_ctx);
+
+        *pubk_len = BN_num_bytes(pub_bn);
+        *pubk = (uint8_t*)OPENSSL_malloc(*pubk_len);
+
+        if (BN_bn2bin(pub_bn, *pubk) != *pubk_len)
+            return -1;
+
+        BN_CTX_end(pub_bn_ctx);
+        BN_CTX_free(pub_bn_ctx);
+        BN_clear_free(pub_bn);
+
+        return 0;
+}
+
+/* Convert an EC key's private key to a binary array. */
+int ec_key_private_key_to_bin(const EC_KEY  *ec_key,
+                              uint8_t      **privk,     // out (must free)
+                              size_t        *privk_len) // out
+{
+        const BIGNUM *priv = EC_KEY_get0_private_key(ec_key);
+
+        *privk_len = BN_num_bytes(priv);
+        *privk = (uint8_t*)OPENSSL_malloc(*privk_len);
+
+        if (BN_bn2bin(priv, *privk) != *privk_len)
+            return -1;
+
+        return 0;
+}
+
+/* Convert a public key binary array to an EC point. */
+int ec_key_public_key_bin_to_point(const EC_GROUP  *ec_group,
+                                   const uint8_t   *pubk,
+                                   const size_t     pubk_len,
+                                   EC_POINT       **pubk_point) // out
+{
+        BIGNUM   *pubk_bn;
+        BN_CTX   *pubk_bn_ctx;
+
+        *pubk_point = EC_POINT_new(ec_group);
+
+        pubk_bn = BN_bin2bn(pubk, pubk_len, NULL);
+        pubk_bn_ctx = BN_CTX_new();
+        BN_CTX_start(pubk_bn_ctx);
+
+        EC_POINT_bn2point(ec_group, pubk_bn, *pubk_point, pubk_bn_ctx);
+
+        BN_CTX_end(pubk_bn_ctx);
+        BN_CTX_free(pubk_bn_ctx);
+        BN_clear_free(pubk_bn);
+
+        return 0;
+}
+
+/* (TX) Generate an ephemeral EC key and associated shared symmetric key. */
+int ecies_transmitter_generate_symkey(const int       curve,
+                                      const uint8_t  *peer_pubk,
+                                      const size_t    peer_pubk_len,
+                                      uint8_t       **epubk,         // out (must free)
+                                      size_t         *epubk_len,     // out
+                                      uint8_t       **skey,          // out (must free)
+                                      size_t         *skey_len)      // out
+{
+        EC_KEY         *ec_key          = NULL; /* ephemeral keypair */
+        const EC_GROUP *ec_group        = NULL;
+        EC_POINT       *peer_pubk_point = NULL;
+
+        /* Create and initialize a new empty key pair on the curve. */
+        ec_key = EC_KEY_new_by_curve_name(curve);
+        EC_KEY_generate_key(ec_key);
+        ec_group = EC_KEY_get0_group(ec_key);
+
+        /* Allocate a buffer to hold the shared symmetric key. */
+        *skey_len = ((EC_GROUP_get_degree(ec_group) + 7) / 8);
+        *skey     = (uint8_t*)OPENSSL_malloc(*skey_len);
+
+        /* Convert the peer public key to an EC point. */
+        ec_key_public_key_bin_to_point(ec_group, peer_pubk, peer_pubk_len,
+                                       &peer_pubk_point);
+
+        /* Generate the shared symmetric key (diffie-hellman primitive). */
+        *skey_len = ECDH_compute_key(*skey, *skey_len, peer_pubk_point,
+                                     ec_key, NULL);
+
+        /* Write the ephemeral key's public key to the output buffer. */
+        ec_key_public_key_to_bin(ec_key, epubk, epubk_len);
+
+        return 0;
+}
+
+/* (RX) Generate the shared symmetric key. */
+int ecies_receiver_generate_symkey(const EC_KEY   *ec_key,
+                                   const uint8_t  *peer_pubk,
+                                   const size_t    peer_pubk_len,
+                                   uint8_t       **skey,          // out (must free)
+                                   size_t         *skey_len)      // out
+{
+        const EC_GROUP *ec_group        = EC_KEY_get0_group(ec_key);
+        EC_POINT       *peer_pubk_point = NULL;
+
+        /* Allocate a buffer to hold the shared symmetric key. */
+        *skey_len = ((EC_GROUP_get_degree(ec_group) + 7) / 8);
+        *skey     = (uint8_t*)OPENSSL_malloc(*skey_len);
+
+        /* Convert the peer public key to an EC point. */
+        ec_key_public_key_bin_to_point(ec_group, peer_pubk, peer_pubk_len,
+                                       &peer_pubk_point);
+
+        /* Generate the shared symmetric key (diffie-hellman primitive). */
+        *skey_len = ECDH_compute_key(*skey, *skey_len, peer_pubk_point,
+                                     (EC_KEY *)ec_key, NULL);
+
+        return 0;
+}
+
+/* Encrypt plaintext data using 256b AES-GCM. */
+int aes_gcm_256b_encrypt(uint8_t  *plaintext,
+                         size_t    plaintext_len,
+                         uint8_t  *skey,
+                         uint8_t  *aad,
+                         size_t    aad_len,
+                         uint8_t **iv,             // out (must free)
+                         uint8_t  *iv_len,         // out
+                         uint8_t **tag,            // out (must free)
+                         uint8_t  *tag_len,        // out
+                         uint8_t **ciphertext,     // out (must free)
+                         uint8_t  *ciphertext_len) // out
+{
+        EVP_CIPHER_CTX *ctx;
+        int len;
+
+        /* Allocate buffers for the IV, tag, and ciphertext. */
+        *iv_len = 12;
+        *iv = (uint8_t*)OPENSSL_malloc(*iv_len);
+        *tag_len = 12;
+        *tag = (uint8_t*)OPENSSL_malloc(*tag_len);
+        *ciphertext = (uint8_t*)OPENSSL_malloc((plaintext_len + 0xf) & ~0xf);
+
+        /* Initialize the context and encryption operation. */
+        ctx = EVP_CIPHER_CTX_new();
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+
+        /* Generate a new random IV. */
+        RAND_pseudo_bytes(*iv, *iv_len);
+
+        /* Prime the key and IV. */
+        EVP_EncryptInit_ex(ctx, NULL, NULL, skey, *iv);
+
+        /* Prime with any additional authentication data. */
+        if (aad && aad_len)
+            EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len);
+
+        /* Encrypt the data. */
+        EVP_EncryptUpdate(ctx, *ciphertext, &len, plaintext, plaintext_len);
+        *ciphertext_len = len;
+
+        /* Finalize the encryption session. */
+        EVP_EncryptFinal_ex(ctx, (*ciphertext + len), &len);
+        *ciphertext_len += len;
+
+        /* Get the authentication tag. */
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, *tag_len, *tag);
+
+        EVP_CIPHER_CTX_free(ctx);
+
+        return 0;
+}
+
+/* Decrypt ciphertext data using 256b AES-GCM. */
+int aes_gcm_256b_decrypt(uint8_t  *ciphertext,
+                         size_t    ciphertext_len,
+                         uint8_t  *skey,
+                         uint8_t  *aad,
+                         size_t    aad_len,
+                         uint8_t  *iv,
+                         uint8_t   iv_len,
+                         uint8_t  *tag,
+                         size_t    tag_len,
+                         uint8_t **plaintext,     // out (must free)
+                         uint8_t  *plaintext_len) // out
+{
+        EVP_CIPHER_CTX *ctx;
+        int len, rc;
+
+        /* Allocate a buffer for the plaintext. */
+        *plaintext = (uint8_t*)OPENSSL_malloc(ciphertext_len);
+
+        /* Initialize the context and encryption operation. */
+        ctx = EVP_CIPHER_CTX_new();
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+
+        /* Prime the key and IV (+length). */
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, iv_len, NULL);
+        EVP_DecryptInit_ex(ctx, NULL, NULL, skey, iv);
+
+        /* Prime with any additional authentication data. */
+        if (aad && aad_len)
+                EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_len);
+
+        /* Decrypt the data. */
+        EVP_DecryptUpdate(ctx, *plaintext, &len, ciphertext, ciphertext_len);
+        *plaintext_len = len;
+
+        /* Set the expected tag value. */
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, tag_len, tag);
+
+        /* Finalize the decryption session. Returns 0 with a bad tag! */
+        rc = EVP_DecryptFinal_ex(ctx, (*plaintext + len), &len);
+
+        EVP_CIPHER_CTX_free(ctx);
+
+        if (rc > 0)
+        {
+                *plaintext_len += len;
+                return 0;
+        }
+        return -1;
+}
+
+int ecies_receiver_load_key(char     *filename,
+                            EC_KEY  **ec_key,    // out
+                            int      *curve,     // out
+                            uint8_t **pubk,      // out (must free)
+                            size_t   *pubk_len,  // out
+                            uint8_t **privk,     // out (must free)
+                            size_t   *privk_len) // out
+{
+        const EC_GROUP *ec_group = NULL;
+        BIO            *bio_key  = NULL;
+        BIO            *bio_out  = NULL; /* stdout */
+
+        /*
+         * Create a BIO object wrapping a file pointer to read the EC key file
+         * in DER format. Then read in and parse the EC key from the file.
+         */
+        bio_key = BIO_new_file(filename, "r");
+        if (bio_key == NULL)
+                return -1;
+        *ec_key = d2i_ECPrivateKey_bio(bio_key, NULL);
+        if (*ec_key == NULL)
+                return 2;
+        BIO_free(bio_key);
+        /* Get the curve parameters from the EC key. */
+        ec_group = EC_KEY_get0_group(*ec_key);
+
+        /* Create a BIO object wrapping stdout. */
+        bio_out = BIO_new_fp(stdout, BIO_NOCLOSE);
+
+        /* Set the point conversion outputs to always be 'uncompressed'. */
+        EC_KEY_set_conv_form(*ec_key, POINT_CONVERSION_COMPRESSED);
+
+        /* Get the EC key's public key in a binary array format. */
+        ec_key_public_key_to_bin(*ec_key, pubk, pubk_len);
+
+        /* Get the EC key's private key in a binary array format. */
+        ec_key_private_key_to_bin(*ec_key, privk, privk_len);
+
+        /* Get the EC key's curve name. */
+        *curve = EC_GROUP_get_curve_name(ec_group);
+
+        return 0;
+}
+
+int ecies_transmitter_send_message(uint8_t        *msg,
+                                   size_t          msg_len,
+                                   int             curve,
+                                   const uint8_t  *peer_pubk,
+                                   const uint8_t   peer_pubk_len,
+                                   uint8_t       **epubk,          // out (must free)
+                                   size_t         *epubk_len,      // out
+                                   uint8_t       **iv,             // out (must free)
+                                   uint8_t        *iv_len,         // out
+                                   uint8_t       **tag,            // out (must free)
+                                   uint8_t        *tag_len,        // out
+                                   uint8_t       **ciphertext,     // out (must free)
+                                   uint8_t        *ciphertext_len) // out
+{
+        uint8_t *skey      = NULL; // DH generated shared symmetric key
+        size_t   skey_len  = 0;
+
+        /* Generate the shared symmetric key (transmitter). */
+        ecies_transmitter_generate_symkey(curve, peer_pubk, peer_pubk_len,
+                                          epubk, epubk_len, &skey, &skey_len);
+        if (skey_len != 32)
+            return skey_len;
+
+        /* Encrypt the data using 256b AES-GCM. */
+        aes_gcm_256b_encrypt(msg, msg_len, skey, NULL, 0,
+                             iv, iv_len, tag, tag_len,
+                             ciphertext, ciphertext_len);
+
+        free(skey);
+
+        return 0;
+}
+
+char* ecies_receiver_recv_message(const EC_KEY  *ec_key,
+                                const uint8_t *peer_pubk,
+                                const uint8_t  peer_pubk_len,
+                                uint8_t       *iv,
+                                uint32_t       iv_len,
+                                uint8_t       *tag,
+                                uint32_t       tag_len,
+                                uint8_t       *ciphertext,
+                                uint32_t       ciphertext_len)
+{
+        // Shared symmetric encryption key (DH generated)
+        uint8_t *skey     = NULL;
+        size_t   skey_len = 0;
+
+        // Decrypted data (plaintext)
+        uint8_t *plaintext     = NULL;
+        uint8_t  plaintext_len = 0;
+
+        /* Generate the shared symmetric key (receiver). */
+        ecies_receiver_generate_symkey(ec_key, peer_pubk, peer_pubk_len,
+                                       &skey, &skey_len);
+        // ogs_error("skey len value ::::: %zu\n", skey_len);
+        if (skey_len != 32)
+            return "skey_len";
+                // err("Invalid symkey length %lub (expecting 256b)\n",
+                //     (skey_len * 8));
+
+        /* Decrypt the data using 256b AES-GCM. */
+        aes_gcm_256b_decrypt(ciphertext, ciphertext_len, skey, NULL, 0,
+                             iv, iv_len, tag, tag_len,
+                             &plaintext, &plaintext_len);
+
+        free(skey);
+        return (char*)plaintext;
+}
+
+
+
+uint8_t *decrypt(char *protectionScheamaId, char *homeNetworkPublicKeyIdentifier, uint8_t *schemeOutput){
+    EC_KEY *ec_key = NULL; // EC key from key file
+
+        // Receiver's EC Key (public, private, curve)
+        uint8_t *pubk      = NULL;
+        size_t   pubk_len  = 0;
+        uint8_t *privk     = NULL;
+        size_t   privk_len = 0;
+        int      curve;
+
+        // Transmitter's ephemeral public EC Key
+        size_t   epubk_len = 33;
+        uint8_t *epubk     = OPENSSL_malloc(epubk_len);
+
+        // AES-GCM encrypted data (IV, authentication tag, ciphertext)
+        uint8_t  iv_len         = 12;
+        uint8_t *iv             = OPENSSL_malloc(iv_len);
+
+        uint8_t  tag_len        = 8;
+        uint8_t *tag            = OPENSSL_malloc(tag_len);
+
+        uint8_t  ciphertext_len = (strlen(schemeOutput)) / 2 - epubk_len - tag_len - iv_len;
+        uint8_t *ciphertext     = OPENSSL_malloc(ciphertext_len);
+        int i=0;
+        for( i=0;i<epubk_len;i++)
+        {
+            uint8_t c = (schemeOutput[i * 2] > '9' ? schemeOutput[i*2] - 'a' +10 : schemeOutput[i*2] - '0') * 16  + (schemeOutput[i * 2 + 1] > '9' ? schemeOutput[i*2+1] - 'a' +10 : schemeOutput[i*2+1] - '0') ;
+            epubk[i] = c;
+            // ogs_error("%c%c     %d      %d", schemeOutput[2*i],schemeOutput[2*i+1], i,epubk[i] );
+        }
+        for( i=epubk_len;i<epubk_len+ciphertext_len;i++)
+        {
+            uint8_t c = (schemeOutput[i * 2] > '9' ? schemeOutput[i*2] - 'a' +10 : schemeOutput[i*2] - '0') * 16  + (schemeOutput[i * 2 + 1] > '9' ? schemeOutput[i*2+1] - 'a' +10 : schemeOutput[i*2+1] - '0') ;
+            ciphertext[i-epubk_len] = c;
+            // ogs_error("%c%c     %zu", schemeOutput[2*i],schemeOutput[2*i+1], i-epubk_len);
+        }
+        for( i=epubk_len+ciphertext_len;i<epubk_len+ciphertext_len+iv_len;i++)
+        {
+            uint8_t c = (schemeOutput[i * 2] > '9' ? schemeOutput[i*2] - 'a' +10 : schemeOutput[i*2] - '0') * 16  + (schemeOutput[i * 2 + 1] > '9' ? schemeOutput[i*2+1] - 'a' +10 : schemeOutput[i*2+1] - '0') ;
+            iv[i-epubk_len-ciphertext_len] = c;
+            // ogs_error("%c%c     %zu", schemeOutput[2*i],schemeOutput[2*i+1], i-epubk_len-ciphertext_len);
+        }
+        for( i=epubk_len+ciphertext_len+iv_len;i<epubk_len+ciphertext_len+iv_len+tag_len;i++)
+        {
+            uint8_t c = (schemeOutput[i * 2] > '9' ? schemeOutput[i*2] - 'a' +10 : schemeOutput[i*2] - '0') * 16  + (schemeOutput[i * 2 + 1] > '9' ? schemeOutput[i*2+1] - 'a' +10 : schemeOutput[i*2+1] - '0') ;
+            tag[i-epubk_len-ciphertext_len-iv_len] = c;
+            // ogs_error("%c%c     %zu", schemeOutput[2*i],schemeOutput[2*i+1], i -epubk_len-ciphertext_len-iv_len);
+        }
+
+        /* ECIES Receiver loads the EC key. */
+        ecies_receiver_load_key("/home/baadalvm/Testing/ecies/keyout.der", &ec_key, &curve,
+                                &pubk, &pubk_len, &privk, &privk_len);
+        return ecies_receiver_recv_message(ec_key, epubk, epubk_len,
+                                    iv, iv_len, tag, tag_len,
+                                    ciphertext, ciphertext_len);
+
+        
+}
+
 char *ogs_supi_from_suci(char *suci)
 {
 #define MAX_SUCI_TOKEN 16
@@ -219,7 +639,20 @@ char *ogs_supi_from_suci(char *suci)
             if (array[2] && array[3] && array[7])
                 supi = ogs_msprintf("imsi-%s%s%s",
                         array[2], array[3], array[7]);
-
+            // ogs_error("array %d     :   %s", 0, array[0] );
+            // ogs_error("array %d     :   %s", 1, array[1] );
+            // ogs_error("array %d     :   %s", 2, array[2] );
+            // ogs_error("array %d     :   %s", 3, array[3] );
+            // ogs_error("array %d     :   %s", 4, array[4] );
+            // ogs_error("array %d     :   %s", 5, array[5] );
+            // ogs_error("array %d     :   %s", 6, array[6] );
+            // ogs_error("array %d     :   %s", 7, array[7] );
+            char* schemeOutputOriginal = (char*) decrypt(array[5],array[6],(uint8_t*) array[7]);
+            // ogs_error("schemeOutputOriginal :   %s", schemeOutputOriginal );
+            // ogs_error("schemeOutputOriginal length :   %zu", strlen(schemeOutputOriginal) );
+            // ogs_error("schemeOutputOriginal length :   %d", schemeOutputOriginal[0] );
+            supi = ogs_msprintf("imsi-%s%s%s",
+                        array[2], array[3], schemeOutputOriginal);
             break;
         DEFAULT
             ogs_error("Not implemented [%s]", array[1]);
@@ -239,7 +672,6 @@ char *ogs_supi_from_supi_or_suci(char *supi_or_suci)
 {
     char *type = NULL;
     char *supi = NULL;
-
     ogs_assert(supi_or_suci);
     type = ogs_id_get_type(supi_or_suci);
     if (!type) {

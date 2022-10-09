@@ -28,25 +28,32 @@ const secret = process.env.SECRET_KEY || 'change-me';
 const api = require('./routes');
 
 const Account = require('./models/account.js');
-
+console.log("HEllo");
+console.log(process.env.DB_URI);
 co(function* () {
   yield app.prepare();
 
   mongoose.Promise = global.Promise;
+  
+  console.log("a");
+
   if (dev) {
     mongoose.set('debug', true);
   }
+  
+console.log("a");
   const db = yield mongoose.connect(process.env.DB_URI, {
     useMongoClient: true,
     /* other options */
   })
-
+console.log("b");
   if (dev) {
     Account.count((err, count) => {
       if (err) {
         console.error(err);
         throw err;
       }
+      console.log("d");
 
       if (!count) {
         const newAccount = new Account();

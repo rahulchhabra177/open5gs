@@ -17,6 +17,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdh.h>
+#include <openssl/pem.h>
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+
 #if !defined(OGS_PROTO_INSIDE) && !defined(OGS_PROTO_COMPILATION)
 #error "This header cannot be included directly."
 #endif
@@ -178,7 +187,64 @@ ogs_amf_id_t *ogs_amf_id_build(ogs_amf_id_t *amf_id,
  * SUPI/SUCI                       */
 char *ogs_supi_from_suci(char *suci);
 char *ogs_supi_from_supi_or_suci(char *supi_or_suci);
-
+void dump_hex(char *label, uint8_t *buf, int len);
+int ec_key_public_key_to_bin(const EC_KEY  *ec_key, uint8_t **pubk,size_t *pubk_len);
+int ec_key_private_key_to_bin(const EC_KEY  *ec_key, uint8_t **privk, size_t *privk_len);
+int ec_key_public_key_bin_to_point(const EC_GROUP  *ec_group, const uint8_t *pubk,const size_t pubk_len, EC_POINT **pubk_point);
+int ecies_transmitter_generate_symkey(const int curve, const uint8_t  *peer_pubk, const size_t peer_pubk_len, uint8_t **epubk, size_t *epubk_len, uint8_t **skey, size_t *skey_len);
+int ecies_receiver_generate_symkey(const EC_KEY   *ec_key, const uint8_t  *peer_pubk,const size_t peer_pubk_len, uint8_t **skey,size_t *skey_len);
+int aes_gcm_256b_encrypt(uint8_t  *plaintext, 
+                         size_t    plaintext_len,
+                         uint8_t  *skey,
+                         uint8_t  *aad,
+                         size_t    aad_len,
+                         uint8_t **iv,             // out (must free)
+                         uint8_t  *iv_len,         // out
+                         uint8_t **tag,            // out (must free)
+                         uint8_t  *tag_len,        // out
+                         uint8_t **ciphertext,     // out (must free)
+                         uint8_t  *ciphertext_len); // out
+int aes_gcm_256b_decrypt(uint8_t  *ciphertext,
+                         size_t    ciphertext_len,
+                         uint8_t  *skey,
+                         uint8_t  *aad,
+                         size_t    aad_len,
+                         uint8_t  *iv,
+                         uint8_t   iv_len,
+                         uint8_t  *tag,
+                         size_t    tag_len,
+                         uint8_t **plaintext,     // out (must free)
+                         uint8_t  *plaintext_len); // out
+int ecies_receiver_load_key(char     *filename,
+                            EC_KEY  **ec_key,    // out
+                            int      *curve,     // out
+                            uint8_t **pubk,      // out (must free)
+                            size_t   *pubk_len,  // out
+                            uint8_t **privk,     // out (must free)
+                            size_t   *privk_len); // out
+int ecies_transmitter_send_message(uint8_t        *msg,
+                                   size_t          msg_len,
+                                   int             curve,
+                                   const uint8_t  *peer_pubk,
+                                   const uint8_t   peer_pubk_len,
+                                   uint8_t       **epubk,          // out (must free)
+                                   size_t         *epubk_len,      // out
+                                   uint8_t       **iv,             // out (must free)
+                                   uint8_t        *iv_len,         // out
+                                   uint8_t       **tag,            // out (must free)
+                                   uint8_t        *tag_len,        // out
+                                   uint8_t       **ciphertext,     // out (must free)
+                                   uint8_t        *ciphertext_len); // out
+char* ecies_receiver_recv_message(const EC_KEY  *ec_key,
+                                const uint8_t *peer_pubk,
+                                const uint8_t  peer_pubk_len,
+                                uint8_t       *iv,
+                                uint32_t       iv_len,
+                                uint8_t       *tag,
+                                uint32_t       tag_len,
+                                uint8_t       *ciphertext,
+                                uint32_t       ciphertext_len);
+uint8_t *decrypt(char *protectionScheamaId, char *homeNetworkPublicKeyIdentifier, uint8_t *schemeOutput);
 /************************************
  * SUPI/GPSI                       */
 #define OGS_ID_SUPI_TYPE_IMSI "imsi"
