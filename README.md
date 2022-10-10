@@ -1,5 +1,10 @@
 <h1 align="center">Open5GS</h1>
 
+<h2>Important Note </h2>
+
+Before Running it, go to build folder in you own system and in the file build.ninja replace all occurences of -pthread by -pthread -lssl -lcrypto
+
+
 If you find Open5GS useful for work, please consider supporting this Open Source project by [Becoming a sponsor](https://github.com/sponsors/acetcom). To manage the funding transactions transparently, you can donate through [OpenCollective](https://opencollective.com/open5gs).
 
 <h3 align="center">Platinum Sponsors</h3>
