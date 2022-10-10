@@ -25,6 +25,7 @@
 #include <openssl/rand.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <time.h>
 
 #if !defined(OGS_PROTO_INSIDE) && !defined(OGS_PROTO_COMPILATION)
 #error "This header cannot be included directly."

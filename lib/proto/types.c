@@ -647,7 +647,22 @@ char *ogs_supi_from_suci(char *suci)
             // ogs_error("array %d     :   %s", 5, array[5] );
             // ogs_error("array %d     :   %s", 6, array[6] );
             // ogs_error("array %d     :   %s", 7, array[7] );
+            struct timespec start, end;
+            struct timespec elapsed;
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+            // clock_t elapsed_time = clock();
             char* schemeOutputOriginal = (char*) decrypt(array[5],array[6],(uint8_t*) array[7]);
+            // elapsed_time = clock() - elapsed_time;
+            // double time_taken = ((double)elapsed_time) / CLOCKS_PER_SEC;
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end);
+            if ((end.tv_nsec-start.tv_nsec)<0) {
+                elapsed.tv_sec = end.tv_sec-start.tv_sec-1;
+                elapsed.tv_nsec = 1000000000+end.tv_nsec-start.tv_nsec;
+            } else {
+                elapsed.tv_sec = end.tv_sec-start.tv_sec;
+                elapsed.tv_nsec = end.tv_nsec-start.tv_nsec;
+            }
+            ogs_info("BEYOND 5G SUCI to SUPI decryption time:%f ms",((float)elapsed.tv_sec)*1e3+((float)elapsed.tv_nsec)*1e-6);
             // ogs_error("schemeOutputOriginal :   %s", schemeOutputOriginal );
             // ogs_error("schemeOutputOriginal length :   %zu", strlen(schemeOutputOriginal) );
             // ogs_error("schemeOutputOriginal length :   %d", schemeOutputOriginal[0] );
